@@ -1,0 +1,374 @@
+---
+title: "Transcription"
+format: html
+editor: visual
+---
+
+# Load Packages
+
+```{r}
+library(httr2)
+library(jsonlite)
+library(tidyverse)
+library(pdftools)
+library(xml2)
+library(stringr)
+library(purrr)
+library(fs)
+library(base64enc)
+library(openai)
+```
+
+# Convert PDFs to PNGs
+
+```{r}
+# FIND PDFs
+pdf_files <- list.files(
+  path = "~/Desktop/MA UC3M/MA Spring 26/Qualitative Methods/Quali Project/archival_documents",
+  pattern = "\\.pdf$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+length(pdf_files) # 66
+
+# Convert PDFs to PNGs
+base_out <- "/Users/lydiacamp/Desktop/MA UC3M/MA Spring 26/Qualitative Methods/Quali Project/png_pages"
+dir.create(base_out, showWarnings = FALSE, recursive = TRUE)
+
+n <- length(pdf_files)
+
+for (i in seq_along(pdf_files)) {
+  pdf <- pdf_files[i]
+  name <- tools::file_path_sans_ext(basename(pdf))
+  out_dir <- file.path(base_out, name)
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+  info <- pdf_info(pdf)
+  pages <- seq_len(info$pages)
+
+  out_files <- file.path(
+    out_dir,
+    sprintf("%s_page_%03d.png", name, pages)
+  )
+
+  if (all(file.exists(out_files))) {
+    cat(sprintf("[%d/%d] Skipping already done: %s\n", i, n, basename(pdf)))
+    next
+  }
+
+  cat(sprintf("[%d/%d] Converting: %s (%d pages)\n", i, n, basename(pdf), info$pages))
+
+  tryCatch({
+    pdf_convert(
+      pdf = pdf,
+      format = "png",
+      dpi = 300,
+      filenames = out_files
+    )
+    cat("   done\n")
+  }, error = function(e) {
+    cat(sprintf("   ERROR: %s\n", conditionMessage(e)))
+  })
+}
+```
+
+# Transcribe PNGs to Text Files
+
+## Collect All Images
+
+```{r}
+image_files <- list.files(
+  "png_pages",
+  pattern = "\\.png$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+length(image_files) # 248 pages in 66 documents
+
+# Organize Images
+images_by_doc <- split(image_files, dirname(image_files))
+
+length(images_by_doc)
+names(images_by_doc)[1]
+images_by_doc[[1]]
+```
+
+## Get Open AI API
+
+```{r}
+Sys.getenv("OPENAI_API_KEY")
+
+openai_key <- Sys.getenv("") # key hidden for privacy reasons
+
+openai_key <- Sys.getenv("OPENAI_API_KEY")
+print(openai_key)
+
+resp <- request("https://api.openai.com/v1/models") |>
+  req_headers(
+    Authorization = paste("Bearer", openai_key)
+  ) |>
+  req_perform()
+
+resp
+```
+
+## Create Transcription Function
+
+```{r}
+transcribe_one_image <- function(image_path) {
+  img_b64 <- base64encode(image_path)
+
+  resp <- request("https://api.openai.com/v1/responses") |>
+    req_method("POST") |>
+    req_headers(
+      Authorization = paste("Bearer", openai_key),
+      `Content-Type` = "application/json"
+    ) |>
+    req_body_json(list(
+      model = "gpt-4.1",
+      input = list(
+        list(
+          role = "user",
+          content = list(
+            list(
+              type = "input_text",
+              text = paste(
+                "Transcribe this 17th- or 18th-century English document page exactly as written.",
+                "Rules:",
+                "- Preserve original spelling, capitalization, punctuation, and lineation where possible.",
+                "- Do not modernize, normalize, summarize, or translate.",
+                "- Do not invent or guess missing text.",
+                "- If a word or passage is illegible or uncertain, write [?].",
+                "- If spelling looks unusual but is legible, transcribe it exactly as written.",
+                "- Output only the transcription itself, with no commentary.",
+                "- We is ofen written as wee or Wee"
+              )
+            ),
+            list(
+              type = "input_image",
+              image_url = paste0("data:image/png;base64,", img_b64)
+            )
+          )
+        )
+      )
+    )) |>
+    req_perform()
+
+  resp_body_json(resp)
+}
+
+extract_response_text <- function(resp_json) {
+  parts <- resp_json$output[[1]]$content
+  text_parts <- vapply(parts, function(x) {
+    if (!is.null(x$text)) x$text else ""
+  }, character(1))
+  paste(text_parts[nzchar(text_parts)], collapse = "\n")
+}
+```
+
+## Transcribe Images
+
+```{r}
+test_folder <- images_by_doc[[1]]
+test_page <- sort(test_folder)[1]
+
+result <- transcribe_one_image(test_page)
+cat(extract_response_text(result))
+```
+
+```{r}
+# Group Function
+extract_response_text <- function(resp_json) {
+  texts <- unlist(lapply(resp_json$output, function(item) {
+    if (!is.null(item$content)) {
+      unlist(lapply(item$content, function(x) {
+        if (!is.null(x$text)) x$text else NULL
+      }))
+    } else {
+      NULL
+    }
+  }))
+  paste(texts, collapse = "\n")
+}
+
+process_one_folder <- function(folder_images, master_file) {
+  folder_images <- sort(folder_images)
+
+  doc_name <- basename(dirname(folder_images[1]))
+  per_doc_file <- file.path(dirname(folder_images[1]), paste0(doc_name, "_transcription.txt"))
+
+  page_blocks <- character(length(folder_images))
+
+  for (j in seq_along(folder_images)) {
+    img <- folder_images[j]
+    page_name <- basename(img)
+
+    cat(sprintf("  Page %d/%d: %s\n", j, length(folder_images), page_name))
+
+    resp <- transcribe_one_image(img)
+    page_text <- extract_response_text(resp)
+
+    page_blocks[j] <- paste(
+      sprintf("=== PAGE %03d | %s ===", j, page_name),
+      page_text,
+      sep = "\n"
+    )
+  }
+
+  doc_text <- paste(
+    paste0("DOCUMENT: ", doc_name),
+    "",
+    paste(page_blocks, collapse = "\n\n"),
+    "",
+    sep = "\n"
+  )
+
+  writeLines(doc_text, per_doc_file)
+  write(doc_text, file = master_file, append = TRUE)
+  write("\n\n", file = master_file, append = TRUE)
+
+  cat(sprintf("Saved: %s\n", per_doc_file))
+
+  invisible(doc_text)
+}
+```
+
+```{r}
+# master file path
+master_file <- file.path("png_pages", "ALL_TRANSCRIPTIONS.txt")
+
+if (file.exists(master_file)) {
+  file.remove(master_file)
+}
+```
+
+```{r}
+# Test on one folder
+process_one_folder(images_by_doc[[1]], master_file)
+```
+
+# Transcribe All Folders:
+
+```{r}
+extract_response_text <- function(resp_json) {
+  texts <- unlist(lapply(resp_json$output, function(item) {
+    if (!is.null(item$content)) {
+      unlist(lapply(item$content, function(x) {
+        if (!is.null(x$text)) x$text else NULL
+      }))
+    } else {
+      NULL
+    }
+  }))
+  paste(texts, collapse = "\n")
+}
+
+transcribe_one_image_retry <- function(image_path, max_tries = 5, wait_seconds = 5) {
+  for (attempt in seq_len(max_tries)) {
+    out <- tryCatch({
+      resp <- transcribe_one_image(image_path)
+      extract_response_text(resp)
+    }, error = function(e) {
+      if (attempt == max_tries) stop(e)
+      Sys.sleep(wait_seconds * attempt)
+      NULL
+    })
+
+    if (!is.null(out)) return(out)
+  }
+}
+
+process_one_folder_safe <- function(folder_images, master_file, pause_between_pages = 1) {
+  folder_images <- sort(folder_images)
+
+  folder_path <- dirname(folder_images[1])
+  doc_name <- basename(folder_path)
+
+  per_doc_file <- file.path(folder_path, paste0(doc_name, "_transcription.txt"))
+  temp_file <- file.path(folder_path, paste0(doc_name, "_transcription_tmp.txt"))
+
+  page_blocks <- character(length(folder_images))
+
+  for (j in seq_along(folder_images)) {
+    img <- folder_images[j]
+    page_name <- basename(img)
+
+    cat(sprintf("    Page %d/%d: %s\n", j, length(folder_images), page_name))
+
+    page_text <- transcribe_one_image_retry(img)
+
+    page_blocks[j] <- paste(
+      sprintf("=== PAGE %03d | %s ===", j, page_name),
+      page_text,
+      sep = "\n"
+    )
+
+    Sys.sleep(pause_between_pages)
+  }
+
+  doc_text <- paste(
+    paste0("DOCUMENT: ", doc_name),
+    "",
+    paste(page_blocks, collapse = "\n\n"),
+    "",
+    sep = "\n"
+  )
+
+  writeLines(doc_text, temp_file)
+  file.rename(temp_file, per_doc_file)
+
+  write(doc_text, file = master_file, append = TRUE)
+  write("\n\n", file = master_file, append = TRUE)
+
+  invisible(per_doc_file)
+}
+```
+
+```{r}
+master_file <- file.path("png_pages", "ALL_TRANSCRIPTIONS.txt")
+log_file <- file.path("png_pages", "transcription_log.csv")
+
+if (!file.exists(log_file)) {
+  writeLines("index,total,folder,status,message", log_file)
+}
+
+for (i in seq_along(images_by_doc)) {
+  folder <- names(images_by_doc)[i]
+  doc_name <- basename(folder)
+  per_doc_file <- file.path(folder, paste0(doc_name, "_transcription.txt"))
+
+  if (file.exists(per_doc_file)) {
+    msg <- sprintf("[%d/%d] Skipping already done: %s", i, length(images_by_doc), doc_name)
+    cat(msg, "\n")
+    flush.console()
+    write(sprintf('%d,%d,"%s",skipped,"already exists"', i, length(images_by_doc), doc_name),
+          file = log_file, append = TRUE)
+    next
+  }
+
+  msg <- sprintf("[%d/%d] Processing: %s", i, length(images_by_doc), doc_name)
+  cat("\n", msg, "\n", sep = "")
+  flush.console()
+
+  result <- tryCatch({
+    process_one_folder_safe(images_by_doc[[i]], master_file)
+    "success"
+  }, error = function(e) {
+    err <- conditionMessage(e)
+    cat(sprintf("  ERROR: %s\n", err))
+    flush.console()
+    write(sprintf('%d,%d,"%s",error,"%s"',
+                  i, length(images_by_doc), doc_name,
+                  gsub('"', "'", err)),
+          file = log_file, append = TRUE)
+    NULL
+  })
+
+  if (!is.null(result)) {
+    write(sprintf('%d,%d,"%s",success,"completed"', i, length(images_by_doc), doc_name),
+          file = log_file, append = TRUE)
+  }
+}
+```
