@@ -1,6 +1,16 @@
 ---
 title: "Transcription"
-format: html
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-copy: true
+    smooth-scroll: true
+    page-layout: article
+execute:
+  enabled: false
 editor: visual
 ---
 
